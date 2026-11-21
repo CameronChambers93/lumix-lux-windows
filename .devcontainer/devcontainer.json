@@ -15,9 +15,7 @@
     // Cameron's knowledge vault (Obsidian), shared read-write by every dc project.
     "source=C:/Users/Cameron/Projects/obsidian,target=/vault,type=bind",
     // Where synced photos land on the PC.
-    "source=C:/Users/Cameron/Pictures/Lumix,target=/photos,type=bind",
-    // Gradle downloads (~1 GB) survive rebuilds.
-    "source=dc-lumix-gradle,target=/home/vscode/.gradle,type=volume"
+    "source=C:/Users/Cameron/Pictures/Lumix,target=/photos,type=bind"
   ],
   "containerEnv": {
     "LUMIX_LIBRARY": "/photos",
@@ -29,8 +27,8 @@
     "GIT_CONFIG_KEY_0": "credential.https://github.com.helper",
     "GIT_CONFIG_VALUE_0": "!f() { test \"$1\" != get || git credential-store --file=/dc-git/credentials get; }; f"
   },
-  // Runs once after the container is created, e.g. "pip install -e ."
-  "postCreateCommand": "",
+  // Fetch the core submodule (drivers, protocol docs) on first start.
+  "postCreateCommand": "git submodule update --init",
   // Start the web app on every container start (log: /tmp/lumix.log).
   "postStartCommand": "sh app/start.sh",
   "customizations": {

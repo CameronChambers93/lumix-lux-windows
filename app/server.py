@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Lumix Wi-Fi sync: pairs with a Panasonic Lumix on the LAN, copies its photos and videos into a library
-folder, and serves a gallery web app to any device on the network. Protocol notes: ../PROTOCOL.md.
+folder, and serves a gallery web app to any device on the network. Protocol notes: core/docs/protocols/panasonic-camcgi.md.
 
 Standard library only. Config via env: LUMIX_PORT (8420), LUMIX_LIBRARY (/photos), LUMIX_DATA (../data),
 LUMIX_CAMERA (initial camera IP; later changes made in the web app are saved in DATA/config.json).
@@ -776,8 +776,8 @@ class Handler(BaseHTTPRequestHandler):
                     return self.send_file(STATIC / "index.html", "text/html; charset=utf-8", cache=False)
                 if p == "/manifest.webmanifest":
                     return self.send_file(STATIC / "manifest.webmanifest", "application/manifest+json")
-                if p == "/lumix.apk":  # the Android app, built by mobile/build.sh
-                    return self.send_file(HERE.parent / "dist" / "lumix.apk",
+                if p == "/lumix.apk":  # the Android app (lumix-lux-android's build.sh); LUMIX_APK points at it
+                    return self.send_file(Path(os.environ.get("LUMIX_APK", HERE.parent / "dist" / "lumix.apk")),
                                           "application/vnd.android.package-archive", cache=False, download_name="lumix.apk")
                 if p == "/icon.svg":
                     return self.send_file(STATIC / "icon.svg", "image/svg+xml")
