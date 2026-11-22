@@ -186,6 +186,8 @@
   .row { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
   .row .primary { order: 2; }   /* first in the DOM so Enter in a field saves, shown last */
   dialog .btn { padding: 8px 14px; }
+  #driverInfo { font-size: 13px; color: var(--muted); }
+  a.btn { color: inherit; text-decoration: none; display: inline-block; font-size: 14px; }
   #findOut { font-size: 13px; color: var(--muted); margin-top: 6px; min-height: 1.4em; }
   .toast { position: fixed; left: 50%; top: calc(70px + env(safe-area-inset-top)); transform: translateX(-50%); background: var(--text); color: var(--bg);
     padding: 8px 14px; border-radius: 10px; font-size: 14px; z-index: 20; opacity: 0; transition: opacity .2s; pointer-events: none; max-width: calc(100% - 32px); }
@@ -293,6 +295,9 @@
     <input id="ipIn" inputmode="decimal" autocomplete="off" placeholder="10.0.0.220">
     <div class="row" style="justify-content:flex-start;margin-top:8px"><button class="btn" id="findBtn" type="button">Find camera</button></div>
     <div id="findOut" role="status"></div>
+    <label>Camera support</label>
+    <div id="driverInfo"></div>
+    <div class="row" style="justify-content:flex-start;margin-top:4px"><a class="btn" href="/diagnostics">Camera diagnostics</a></div>
     <label>Theme</label>
     <div class="seg" id="themeSeg" role="group" aria-label="Theme">
       <button type="button" data-t="system" class="on" aria-pressed="true">System</button><button type="button" data-t="light" aria-pressed="false">Light</button><button type="button" data-t="dark" aria-pressed="false">Dark</button>
@@ -376,7 +381,7 @@ async function poll() {
 function renderStatus() {
   const c = status.camera, s = status.sync;
   $("camPill").classList.toggle("on", c.online);
-  $("camText").textContent = c.online ? `ZS100 · battery ${c.battery || "?"}` : c.searching ? "Searching for the camera…" : "Camera offline";
+  $("camText").textContent = c.online ? `${c.model || "Camera"} · battery ${c.battery || "?"}` : c.searching ? "Searching for the camera…" : "Camera offline";
   $("offlineHelp").hidden = c.online || s.running;
   $("progress").hidden = !s.running;
   $("cancelBtn").hidden = !s.running;
@@ -1013,7 +1018,10 @@ matchMedia("(prefers-color-scheme: dark)").addEventListener?.("change", applyThe
 $("themeSeg").addEventListener("click", (e) => { const t = e.target.closest("button")?.dataset.t; if (t) { store.set("theme", t); applyTheme(); } });
 applyTheme();
 $("settingsBtn").onclick = () => {
-  $("ipIn").value = status?.camera.ip || ""; $("libPath").textContent = status?.library.path || ""; $("findOut").textContent = "";
+  $("ipIn").value = status?.camera.ip || ""; $("libPath").textContent = status?.library.path || "";
+  const d = status?.camera.driver;
+  $("driverInfo").textContent = !d ? "" : d.matched ? `${d.name} (driver ${d.id}${status.camera.firmware ? `, firmware ${status.camera.firmware}` : ""})`
+    : status.camera.online ? `${status.camera.model || "This camera"} has no driver yet: gallery and copying only.` : "Not connected yet."; $("findOut").textContent = "";
   $("settings").showModal();
 };
 $("findBtn").onclick = async () => {

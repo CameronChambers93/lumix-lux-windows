@@ -1,29 +1,35 @@
 #!/usr/bin/env python3
 """Lumix Wi-Fi sync: pairs with a Panasonic Lumix on the LAN, copies its photos and videos into a library
-folder, and serves a gallery web app to any device on the network. Protocol notes: core/docs/protocols/panasonic-camcgi.md.
+folder, and serves a gallery web app to any device on the network. The camera code is core's luxcamera runtime, driven by
+the drivers in core/drivers; protocol notes: core/docs/protocols/panasonic-camcgi.md.
 
 Standard library only. Config via env: LUMIX_PORT (8420), LUMIX_LIBRARY (/photos), LUMIX_DATA (../data),
-LUMIX_CAMERA (initial camera IP; later changes made in the web app are saved in DATA/config.json).
+LUMIX_CAMERA (initial camera IP; later changes made in the web app are saved in DATA/config.json),
+LUMIX_PORT_MAP (tests only: "80:18080,60606:18080" sends the camera's ports to tools/fakecam.py's one port).
 """
+from __future__ import annotations
+
 import json
 import os
 import re
-import socket
 import struct
+import sys
 import threading
 import time
 import traceback
-import urllib.error
 import urllib.parse
-import urllib.request
 import uuid
-import xml.etree.ElementTree as ET
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE.parent / "core" / "py"))  # the core submodule (the release zip has the same layout)
+import luxcamera as lux  # noqa: E402
+
+import diagnostics  # noqa: E402
+
 PORT = int(os.environ.get("LUMIX_PORT", "8420"))
 LIBRARY = Path(os.environ.get("LUMIX_LIBRARY", "/photos"))
 DATA = Path(os.environ.get("LUMIX_DATA", HERE.parent / "data"))
@@ -31,18 +37,9 @@ STATIC = HERE / "static"
 APP_NAME = "lumix-hub"
 MEDIA_RE = re.compile(r"P(\d+)\.(JPG|MP4)", re.I)
 CTYPES = {"JPG": "image/jpeg", "MP4": "video/mp4"}
-BUSY = "err_already_connected"  # the camera serves one app at a time
-
-NS = {
-    "d": "urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/",
-    "dc": "http://purl.org/dc/elements/1.1/",
-    "upnp": "urn:schemas-upnp-org:metadata-1-0/upnp/",
-}
-BROWSE = """<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" \
-s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body>\
-<u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1"><ObjectID>0</ObjectID>\
-<BrowseFlag>BrowseDirectChildren</BrowseFlag><Filter>*</Filter><StartingIndex>{start}</StartingIndex>\
-<RequestedCount>{count}</RequestedCount><SortCriteria></SortCriteria></u:Browse></s:Body></s:Envelope>"""
+PORT_MAP = dict(map(int, kv.split(":")) for kv in os.environ.get("LUMIX_PORT_MAP", "").split(",") if kv)
+DRIVERS = lux.load_drivers()
+BASE = lux.match_driver(DRIVERS, {})["driver"]  # the family base: used to find a camera before we know which one it is
 
 
 def log(*a):
@@ -191,52 +188,22 @@ SWEEP_TIMEOUT = 1.5
 SWEEP_THREADS = 32
 
 
-def probe_camera(ip: str, port: int = 80, timeout: float = SWEEP_TIMEOUT):
-    """Is there a Lumix at ip? 'ok' for a <camrply> answer, 'busy' for a 503 from a host that also answers on
-    :60606 (the camera's UPnP port) while another app holds it, else None."""
-    try:
-        with urllib.request.urlopen(f"http://{ip}:{port}/cam.cgi?mode=getstate", timeout=timeout) as r:
-            return "ok" if b"<camrply" in r.read(4096) else None
-    except urllib.error.HTTPError as e:
-        if e.code != 503:
-            return None
-    except Exception:
-        return None
-    try:
-        socket.create_connection((ip, 60606), timeout=timeout).close()
-        return "busy"
-    except OSError:
-        return None
+def probe_camera(ip: str, timeout: float = SWEEP_TIMEOUT):
+    """Is there a camera of the driver family at ip? 'ok', 'busy' (another app holds it), else None."""
+    return lux.Camera(BASE, ip, port_map=PORT_MAP).probe(timeout)
 
 
 def ssdp_search(timeout: float = 1.5) -> list[str]:
-    """Multicast M-SEARCH; returns IPs whose LOCATION is on port 60606 or whose SERVER says Panasonic.
+    """Multicast M-SEARCH; returns the IPs of replies that look like the driver family's cameras.
     Docker NAT blocks the replies, so this usually returns nothing there; it works on a plain LAN."""
     found: list[str] = []
-    msg = (b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 1\r\n'
-           b'ST: urn:schemas-upnp-org:device:MediaServer:1\r\n\r\n')
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.settimeout(0.3)
-        s.sendto(msg, ("239.255.255.250", 1900))
-        end = time.time() + timeout
-        while time.time() < end:
-            try:
-                data, addr = s.recvfrom(4096)
-            except socket.timeout:
-                continue
-            t = data.decode("utf-8", "replace")
-            if ":60606" in t or "panasonic" in t.lower():
-                if addr[0] not in found:
-                    found.append(addr[0])
-    except OSError:
-        pass
-    finally:
-        s.close()
+    for sender, reply in lux.ssdp_search(lux.ssdp_request(BASE), timeout=timeout):
+        if lux.parse_ssdp(reply, BASE)["matches"] and sender not in found:
+            found.append(sender)
     return found
 
 
-def sweep_subnet(ip: str, port: int = 80):
+def sweep_subnet(ip: str):
     """Probe every host of ip's /24 (not ip itself) in parallel; returns (found_ip, kind) for the first camera."""
     parts = ip.split(".")
     if len(parts) != 4 or not all(p.isdigit() for p in parts):
@@ -245,7 +212,7 @@ def sweep_subnet(ip: str, port: int = 80):
     hosts = [f"{base}.{n}" for n in range(1, 255) if f"{base}.{n}" != ip]
     ex = ThreadPoolExecutor(SWEEP_THREADS)
     try:
-        for host, kind in zip(hosts, ex.map(lambda h: probe_camera(h, port), hosts)):
+        for host, kind in zip(hosts, ex.map(probe_camera, hosts)):
             if kind:
                 return host, kind
     finally:
@@ -256,151 +223,122 @@ def sweep_subnet(ip: str, port: int = 80):
 # ---------------------------------------------------------------- camera
 
 class Camera:
+    """The one camera the server holds: luxcamera's Camera plus online/error state for the page. It starts with the
+    family base driver; each time the camera comes online it asks what it is and switches to the matching driver."""
+
     def __init__(self, ip: str, app_id: str):
-        self.ip = ip
         self.app_id = app_id
         self.online = False
-        self.state: dict = {}
+        self.state: dict = {}  # luxcamera's parsed getstate: ok, battery, mode, state (the raw fields)
         self.error = ""
-        self.cds_url = None  # ContentDirectory control URL, found via SSDP
-        self.media_slots = threading.Semaphore(2)  # the camera's web server is small; don't flood it
-        self.lock = threading.Lock()
+        self.info: dict = {}  # what identify() said: capabilityModel, modelNumber, friendlyName, firmware
+        self.match = {"driver": BASE, "matched": False, "by": None}
+        self.lc = self._lux(BASE, ip)
 
-    def cam(self, mode: str, timeout: float = 4, **params) -> str:
-        q = urllib.parse.urlencode({"mode": mode, **params})
-        with urllib.request.urlopen(f"http://{self.ip}/cam.cgi?{q}", timeout=timeout) as r:
-            return r.read().decode("utf-8", "replace")
+    def _lux(self, driver: dict, ip: str):
+        lc = lux.Camera(driver, ip, app_id=self.app_id, app_name=APP_NAME, port_map=PORT_MAP)
+        self.media_slots = threading.Semaphore(driver["media"]["slots"])  # the camera's web server is small; don't flood it
+        return lc
+
+    @property
+    def ip(self) -> str:
+        return self.lc.ip
+
+    def move(self, ip: str):
+        """A new address (found by a search or typed in Settings): forget the connection, keep the driver until it answers."""
+        self.lc = self._lux(self.lc.driver, ip)
+        self.online = False
+
+    @property
+    def driver(self) -> dict:
+        return self.lc.driver
 
     def poll(self) -> bool:
         """Keepalive and online check. Returns True when the camera has just come online."""
         try:
-            x = self.cam("getstate")
-            root = ET.fromstring(x)
-            result = root.findtext("result")
-            if result == BUSY:
-                raise RuntimeError(BUSY)
-            if result != "ok":
-                self.pair()
-                root = ET.fromstring(self.cam("getstate"))
-            st = root.find("state")
-            self.state = {c.tag: c.text for c in st} if st is not None else {}
-            self.ensure_play()
             came_online = not self.online
             if came_online:
-                self.pair()
-                self.cds_url = None
+                st = self.lc.connect()  # getstate, pair, media mode
+                log("paired with", self.ip)
+                self.identify()
+            else:
+                st = self.lc.state()
+                if not st["ok"]:
+                    self.lc.pair()
+                    st = self.lc.state()
+                self.ensure_play()
+            self.state = dict(self.lc.last_state or st)
             self.online, self.error = True, ""
             return came_online
         except Exception as e:  # timeouts are the normal "camera off" case
             if self.online:
                 log("camera offline:", e)
-            self.online, self.cds_url = False, None
-            if BUSY in str(e) or "503" in str(e):
+            self.online = False
+            if isinstance(e, lux.Busy):
                 self.error = "The camera is connected to another device (the phone app?). Close it there."
-            elif isinstance(e, (OSError, socket.timeout)):
+            elif isinstance(e, OSError):
                 self.error = "Camera not reachable"
             else:
                 self.error = str(e)
             return False
 
+    def identify(self):
+        """Ask the camera what it is (unicast SSDP -> device description, and the capability reply), pick the driver."""
+        location = None
+        try:
+            ssdp = self.driver["discovery"]["ssdp"]
+            for _, reply in lux.ssdp_search(lux.ssdp_request(self.driver, multicast=False), (self.ip, ssdp["port"]), 1.5):
+                s = lux.parse_ssdp(reply, self.driver)
+                if s["matches"] and s["location"]:
+                    location = s["location"]
+                    break
+            self.info = self.lc.identify(location)
+        except Exception as e:
+            log("identify failed:", e)
+            self.info = self.lc.identify(None)  # the capability reply alone
+        m = lux.match_driver(DRIVERS, self.info)
+        cds = self.lc.cds_url
+        if m["driver"]["id"] != self.driver["id"]:
+            self.lc = self._lux(m["driver"], self.ip)
+            self.lc.last_state = None
+        self.lc.cds_url = cds
+        self.match = m
+        log(f"camera: {self.info or 'unknown'} -> driver {m['driver']['id']}" + (f" (by {m['by']})" if m["matched"] else " (cautious mode)"))
+
     def ensure_play(self, fresh: bool = False):
-        """The camera sometimes sits in rec mode (it goes back to its live view by itself after a client leaves),
-        and media access should happen in playback mode. playmode is non-destructive; send it whenever cammode isn't play."""
+        """The camera drops back to rec mode by itself after a client leaves, and media access wants playback mode.
+        Non-destructive; luxcamera sends it whenever the mode isn't the driver's media mode."""
         try:
             if fresh:
-                st = ET.fromstring(self.cam("getstate")).find("state")
-                self.state = {c.tag: c.text for c in st} if st is not None else {}
-            mode = self.state.get("cammode")
-            if mode and mode != "play":
-                log(f"camera was in {mode} mode: sending playmode")
-                self.cam("camcmd", value="playmode")
-                self.state["cammode"] = "play"
-                time.sleep(2.0)
+                self.lc.state()
+            if self.lc.ensure_media(self.lc.last_state):
+                log("camera was not in media mode: switched")
         except Exception as e:
             log("ensure_play failed:", e)
 
-    def pair(self) -> str:
-        r = self.cam("accctrl", timeout=15, type="req_acc", value=self.app_id, value2=APP_NAME).strip()
-        log("pair:", r)
-        if not r.startswith("ok"):
-            raise RuntimeError(BUSY if BUSY in r else f"Camera refused pairing: {r}")
-        return r
-
-    def find_cds(self) -> str:
-        if self.cds_url:
-            return self.cds_url
-        url = f"http://{self.ip}:60606/Server0/CDS_control"  # what the ZS100 uses; SSDP confirms it
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.settimeout(3)
-            s.sendto(b'M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: "ssdp:discover"\r\nMX: 2\r\n'
-                     b'ST: urn:schemas-upnp-org:service:ContentDirectory:1\r\n\r\n', (self.ip, 1900))
-            reply = s.recvfrom(4096)[0].decode("utf-8", "replace")
-            s.close()
-            loc = re.search(r"^LOCATION:\s*(\S+)", reply, re.I | re.M).group(1)
-            with urllib.request.urlopen(loc, timeout=8) as r:
-                ddd = r.read().decode("utf-8", "replace")
-            m = re.search(r"ContentDirectory:1</serviceType>.*?<controlURL>([^<]+)", ddd, re.S)
-            if m:
-                url = urllib.parse.urljoin(loc, m.group(1).strip())
-        except Exception as e:
-            log("SSDP discovery failed, using default URL:", e)
-        self.cds_url = url
-        return url
-
     def browse_all(self) -> list[dict]:
         self.ensure_play(fresh=True)
-        url, items, start, total = self.find_cds(), [], 0, None
-        while total is None or start < total:
-            body = BROWSE.format(start=start, count=50).encode()
-            req = urllib.request.Request(url, body, {
-                "Content-Type": 'text/xml; charset="utf-8"',
-                "SOAPACTION": '"urn:schemas-upnp-org:service:ContentDirectory:1#Browse"'})
-            with urllib.request.urlopen(req, timeout=30) as r:
-                env = ET.fromstring(r.read())
-            resp = env.find(".//{urn:schemas-upnp-org:service:ContentDirectory:1}BrowseResponse")
-            total = int(resp.findtext("TotalMatches") or 0)
-            got = int(resp.findtext("NumberReturned") or 0)
-            items += parse_didl(resp.findtext("Result") or "")
-            if got == 0:
-                break
-            start += got
-        return items
+        return self.lc.list()
 
-    def fetch(self, url: str, timeout: float = 30):
-        return urllib.request.urlopen(url, timeout=timeout)
+    def date(self, item: dict):
+        with self.media_slots:
+            return self.lc.date(item)
 
+    def open(self, item: dict, role: str = "orig", timeout: float = 30, headers: dict | None = None):
+        """A streaming response for an item (guard-checked by luxcamera). headers e.g. a Range for the EXIF head."""
+        req = self.lc.media_request(item, role)
+        return self.lc.t.open(req["url"], timeout, {**req["headers"], **(headers or {})})
 
-def parse_dur(text) -> int:
-    """duration="0:00:01" (h:mm:ss, maybe with .fraction) -> whole seconds."""
-    m = re.fullmatch(r"(\d+):(\d+):(\d+)(?:\.\d+)?", (text or "").strip())
-    return int(m[1]) * 3600 + int(m[2]) * 60 + int(m[3]) if m else 0
+    def date_of(self, response):
+        return self.lc.date_from_headers(response.headers)
 
-
-def parse_didl(didl: str) -> list[dict]:
-    out = []
-    if not didl.strip():
-        return out
-    for it in ET.fromstring(didl).findall("d:item", NS):
-        res, dur = {}, 0
-        for r in it.findall("d:res", NS):
-            m = re.search(r"PANASONIC\.COM_PN=(\w+)", r.get("protocolInfo", ""))
-            if m and r.text:
-                res[m.group(1)] = (r.text.strip(), int(r.get("size") or 0))
-                if m.group(1) == "CAM_ORG":
-                    dur = parse_dur(r.get("duration"))
-        iid = it.get("id", "")
-        if "CAM_ORG" not in res or not iid.isdigit():
-            continue
-        url, size = res["CAM_ORG"]
-        ext = url.rsplit(".", 1)[-1].upper()
-        out.append({
-            "id": iid, "name": f"P{iid}.{ext}", "size": size,
-            "kind": "video" if "video" in (it.findtext("upnp:class", "", NS)) else "photo",
-            "orig": url, "thumb": res.get("CAM_TN", ("",))[0], "preview": res.get("CAM_LRGTN", ("",))[0],
-            "dur": dur,
-        })
-    return out
+    def status(self) -> dict:
+        d, info = self.driver, self.info
+        return {"driver": {"id": d["id"], "name": d["name"], "matched": self.match["matched"], "by": self.match["by"],
+                           "features": d["features"]},
+                "model": (d.get("label") if self.match["matched"] else None) or info.get("modelNumber")
+                or info.get("capabilityModel") or (d.get("label") if self.state else None),
+                "firmware": info.get("firmware")}
 
 
 # ---------------------------------------------------------------- app state
@@ -423,6 +361,7 @@ class App:
         self.dates: dict[str, str] = read_json(DATA / "dates.json", {})
         self.dates_dirty, self.dates_saved = False, 0.0
         self.exif_cache: dict[str, dict] = read_json(DATA / "exif.json", {})
+        self.inbox = diagnostics.Inbox(DATA / "diagnostics" / "inbox")  # reports from the phone app's "Add a camera"
         self.local_meta: dict[str, tuple] = {}  # library file name -> ((mtime_ns, size), iso date, from_exif)
         self.persist_lock = threading.Lock()
         self.last_media = 0.0  # last time a page-driven fetch (preview, original, details) used the camera
@@ -451,7 +390,7 @@ class App:
             else:
                 if self.cam.online:
                     log("idle: releasing the camera")
-                self.cam.online, self.cam.cds_url, self.cam.error = False, None, "Idle (not connected)"
+                self.cam.online, self.cam.error = False, "Idle (not connected)"
                 time.sleep(1)
 
     # -- capture dates
@@ -471,16 +410,11 @@ class App:
             write_json(DATA / "dates.json", dict(self.dates))
 
     def fetch_date(self, item: dict) -> bool:
-        """One tiny request for the thumbnail's headers: HEAD, or a 1-byte ranged GET if HEAD has no date header."""
-        with self.cam.media_slots:
-            for method, hdr in (("HEAD", {}), ("GET", {"Range": "bytes=0-0"})):
-                req = urllib.request.Request(item["thumb"], method=method, headers=hdr)
-                with urllib.request.urlopen(req, timeout=8) as r:
-                    v = r.headers.get("X-REC_DATE_TIME")
-                    if v:
-                        self.record_date(item["id"], v)
-                        return True
-        return False
+        """One tiny request (the driver says which file and header) for the capture date."""
+        v = self.cam.date(item)
+        if v:
+            self.record_date(item["id"], v)
+        return bool(v)
 
     def fill_dates(self):
         """Background: while the camera is held and nothing else is using it, look up the capture date of items that
@@ -544,7 +478,7 @@ class App:
             log(f"search: found the camera at {ip} via {how} ({time.time() - self.last_search:.1f}s)")
             self.cfg["camera_ip"] = ip
             write_json(DATA / "config.json", self.cfg)
-            self.cam.ip, self.cam.online, self.cam.cds_url = ip, False, None
+            self.cam.move(ip)
             if self.cam.poll():
                 self.refresh_catalog()
             return True
@@ -554,7 +488,7 @@ class App:
     def set_camera_ip(self, ip: str):
         self.cfg["camera_ip"] = ip
         write_json(DATA / "config.json", self.cfg)
-        self.cam.ip, self.cam.online, self.cam.cds_url = ip, False, None
+        self.cam.move(ip)
         self.last_search = 0.0  # a manual address is tried first; searching resumes if it doesn't answer
         threading.Thread(target=lambda: self.cam.poll() and self.refresh_catalog(), daemon=True).start()
 
@@ -650,9 +584,8 @@ class App:
             return {"error": "Camera is offline and this photo isn't on the PC yet"}, 409
         else:
             self.last_media = time.time()
-            req = urllib.request.Request(item["orig"], headers={"Range": f"bytes=0-{EXIF_HEAD - 1}"})
             try:
-                with self.cam.media_slots, urllib.request.urlopen(req, timeout=20) as r:
+                with self.cam.media_slots, self.cam.open(item, "orig", 20, {"Range": f"bytes=0-{EXIF_HEAD - 1}"}) as r:
                     head = r.read(EXIF_HEAD)  # a camera that ignores Range just gets closed after the first 128 KB
             finally:
                 self.last_media = time.time()
@@ -673,8 +606,8 @@ class App:
             if dest.exists() and dest.stat().st_size == item["size"]:
                 return dest
             part = dest.with_name(dest.name + ".part")
-            with self.cam.media_slots, self.cam.fetch(item["orig"], timeout=60) as r, open(part, "wb") as f:
-                self.record_date(item["id"], r.headers.get("X-REC_DATE_TIME"))
+            with self.cam.media_slots, self.cam.open(item, "orig", 60) as r, open(part, "wb") as f:
+                self.record_date(item["id"], self.cam.date_of(r))
                 while chunk := r.read(256 * 1024):
                     if self.sync["cancel"] and progress:
                         raise InterruptedError("cancelled")
@@ -742,9 +675,9 @@ class App:
             return None
         self.last_media = time.time()
         try:
-            with self.cam.media_slots, self.cam.fetch(item[kind], timeout=20) as r:
+            with self.cam.media_slots, self.cam.open(item, kind, 20) as r:
                 data = r.read()
-                self.record_date(iid, r.headers.get("X-REC_DATE_TIME"))
+                self.record_date(iid, self.cam.date_of(r))
         finally:
             if kind == "preview":  # grid thumbnails don't hold the date filler back, a viewer's preview does
                 self.last_media = time.time()
@@ -781,6 +714,13 @@ class Handler(BaseHTTPRequestHandler):
                                           "application/vnd.android.package-archive", cache=False, download_name="lumix.apk")
                 if p == "/icon.svg":
                     return self.send_file(STATIC / "icon.svg", "image/svg+xml")
+                if p == "/diagnostics":
+                    return self.send_file(STATIC / "diagnostics.html", "text/html; charset=utf-8", cache=False)
+                if p == "/api/diagnostics":
+                    return self.json({"reports": APP.inbox.list()})
+                if m := re.fullmatch(r"/api/diagnostics/([^/]+)", p):
+                    path = APP.inbox.path(urllib.parse.unquote(m.group(1)))
+                    return self.send_file(path, "application/json", cache=False) if path else self.json({"error": "not found"}, 404)
                 if p == "/api/status":
                     return self.json(self.status())
                 if p == "/api/items":
@@ -795,6 +735,14 @@ class Handler(BaseHTTPRequestHandler):
                 if p == "/zip":
                     return self.zip([i for i in q.get("ids", [""])[0].split(",") if i.isdigit()])
             elif self.command == "POST":
+                if p == "/api/diagnostics":  # a report from a phone; raw bytes, capped before reading
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n > diagnostics.MAX_BYTES:
+                        return self.json({"error": "The report is too large"}, 413)
+                    try:
+                        return self.json(APP.inbox.save(self.rfile.read(n)))
+                    except ValueError as e:
+                        return self.json({"error": str(e)}, 400)
                 body = self.body()
                 if p == "/api/sync":
                     ids = body.get("ids")
@@ -846,8 +794,7 @@ class Handler(BaseHTTPRequestHandler):
             on_camera = len(APP.catalog)
         return {
             "camera": {"ip": c.ip, "online": c.online, "searching": APP.searching, "error": c.error or APP.catalog_error,
-                       "battery": c.state.get("batt"), "mode": c.state.get("cammode"),
-                       "model": "ZS100" if c.state else None},
+                       "battery": c.state.get("battery"), "mode": c.state.get("mode"), **c.status()},
             "library": {"path": os.environ.get("LUMIX_LIBRARY_LABEL", str(LIBRARY)), "count": len(local)},
             "on_camera": on_camera, "missing": missing, "sync": s,
         }

@@ -1,15 +1,19 @@
 # lumix-lux-windows
 
 PC web app that copies photos and videos off a Panasonic Lumix over Wi-Fi into `%USERPROFILE%\Pictures\Lumix` and lets any
-device on the home network browse and download them. Today it supports the ZS100 only; the multi-camera redesign plan is
-`core/docs/REDESIGN.md` (read it before changing camera code). Protocol: `core/docs/protocols/panasonic-camcgi.md`.
+device on the home network browse and download them. The camera code is core's runtime `core/py/luxcamera`, driven by the
+drivers in `core/drivers` (the ZS100 has one; other cameras of the family run in cautious mode). The multi-camera redesign plan
+is `core/docs/REDESIGN.md` (read it before changing camera code). Protocol: `core/docs/protocols/panasonic-camcgi.md`.
 
-- **Shared code is in `core/`** (git submodule, repo `lumix-lux-core`): drivers, protocol doc, `core/tools/fakecam.py`.
+- **Shared code is in `core/`** (git submodule, repo `lumix-lux-core`): the camera runtime, drivers, protocol doc, `core/tools/fakecam.py`.
+  `server.py` has no camera protocol of its own: requests, parsing and the denylist guard are luxcamera's. A camera fix goes into core.
   Edit it in `core/`, commit and push there, then commit the submodule bump here. If `core/` is empty: `git submodule update --init`.
 - **URL:** http://10.0.0.129:8420 (the PC's LAN address; port published by this dc container).
 - **Camera:** joins the home Wi-Fi "Via Network" (Wi-Fi → Remote Shooting & View) and is at `10.0.0.220`
   (changeable in the app's settings, saved in `data/config.json`). It only answers while on that waiting screen.
-- **Code:** `app/server.py` (standard-library Python, no deps) + `app/static/index.html` (single page, no build step).
+- **Code:** `app/server.py` (standard-library Python, no deps; imports `core/py/luxcamera`) + `app/static/index.html` (single page,
+  no build step). Its `Camera` wraps `luxcamera.Camera`: on connect it identifies the camera (unicast SSDP → device description,
+  plus the capability reply), `match_driver` picks the driver, and `/api/status` reports `camera.driver`/`model`/`firmware`.
   `app/start.sh` (re)starts it in the background; `postStartCommand` runs it on every container start. Log: `/tmp/lumix.log`.
   After editing the server: `sh app/start.sh`. Static files are read per request, so no restart for those.
 - **Paths in the container:** library `/photos` (bind mount of `Pictures\Lumix`), app state in `data/` (gitignored:
@@ -28,10 +32,16 @@ device on the home network browse and download them. Today it supports the ZS100
   newest-first when the camera is held and idle; library JPEGs use EXIF), `GET /api/exif/<id>` (pure-Python parser; local file or the first
   128 KB of the camera original; cached in `data/exif.json`), `POST /api/find`; `/api/items` rows have `date`, `dur`, `w`, `h`.
   `python3 app/test_exif.py` checks the EXIF parser.
+- **Tests:** `python3 app/test_server.py` runs the real server against `core/tools/fakecam.py` (status, driver match, items, dates,
+  thumbnails, sync, media/zip, find camera, busy, cautious mode, diagnostics, no denylisted request), ~20 s; `LUMIX_PORT_MAP`
+  maps the camera's ports onto fakecam's one port. Also `app/test_exif.py`, `app/test_diagnostics.py`.
+- **Diagnostics inbox:** `POST /api/diagnostics` (a report from the phone app's "Add a camera", JSON, max 20 MB) is stored in
+  `data/diagnostics/inbox/<model>-<date>.json` (`app/diagnostics.py`); `/diagnostics` lists them (linked from Settings).
 - The camera's web server is tiny: camera fetches go through a 2-slot semaphore, and the full-file download is serial.
 - **`/lumix.apk`** serves the Android app from `$LUMIX_APK` (default `dist/lumix.apk`); the APK is built in lumix-lux-android,
   copy it here to offer it on the LAN.
-- **Release:** `sh pc/release.sh <version>` → `dist/lumix-pc-<version>.zip` (the app, `lumix.bat`, the protocol doc). Users unzip it, install
+- **Release:** `sh pc/release.sh <version>` → `dist/lumix-pc-<version>.zip` (the app, core's `py/luxcamera` + `drivers/` + `schema/`
+  under `core/` like here, `lumix.bat`, the protocol doc). Users unzip it, install
   Python 3.9+ and double-click `lumix.bat`.
 
 History: split from `lumix-zs100-controller` with history kept (before the split, paths were `app/`, `pc/` at the same place).

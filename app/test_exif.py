@@ -19,7 +19,6 @@ class ExifTest(unittest.TestCase):
     def test_garbage(self):
         self.assertEqual(server.parse_exif(b"not a jpeg"), {})
         self.assertEqual(server.parse_exif(b"\xff\xd8\xff\xe1\x00\x10Exif\x00\x00II*\x00"), {})  # truncated
-        self.assertEqual(server.parse_dur("0:01:05"), 65)
 
 
 if __name__ == "__main__":
